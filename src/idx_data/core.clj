@@ -4,7 +4,7 @@
             [clojure.data.csv :as csv]
             [clojure.java.io :as io]
             [clj-time.format :as datefmt])
-  (:use [clojure.core.async :only [chan go close! >! >!! <! <!!]])
+  (:use [clojure.core.async :only [chan go close! >! >!! <! <!! put!]])
   (:gen-class))
 
 (def quandl-url "https://www.quandl.com/api/v3/datasets/")
@@ -16,13 +16,15 @@
     (str url "&api_key=" API_KEY)
     (str url "?api_key=" API_KEY)))
 
+(def cm2 (clj-http.conn-mgr/make-reusable-conn-manager {:timeout 10 :threads 1}))
+
 (defn quandl->json
   [code start-date]
-     (println (str "Processing " code))
-     (json/read-str
-      (:body (client/get
-              (wrap-api-key
-               (str quandl-url code ".json?start_date=" start-date)) {:as :json}))))
+    (println (str "Processing " code))
+    (json/read-str
+     (:body (client/get
+             (wrap-api-key
+              (str quandl-url code ".json?start_date=" start-date)) {:connection-manager cm2 :as :json}))))
 
 
 (defn json->csv
@@ -54,20 +56,19 @@
 (defn make-csv!
   [codes date]
   (let [c (chan 10)]
-    (go
-     (doseq [code codes]
-       (>! c (->>
-              (quandl->json code date)
-              (json->csv)
-              (metastock-format))))
-     (close! c))
+    (client/with-connection-pool {:timeout 5 :threads 4 :insecure? false :default-per-route 10}
+    (doseq [code codes]
+      (go (>! c (->>
+                 (quandl->json code date)
+                 (json->csv)
+                 (metastock-format))))))
 
      (with-open [out-file (io/writer (str date ".csv"))]
        (csv/write-csv out-file [["<date>" "<ticker>" "<open>" "<high>" "<low>" "<close>" "<volume>"]])
-       (loop []
-         (when-let [val (<!! c)]
-           (csv/write-csv out-file val)
-           (recur))))))
+       (loop [n (count codes)]
+         (when (> n 0)
+           (csv/write-csv out-file (<!! c))
+           (recur (dec n)))))))
 
 (defn jk-codes
   [url]
@@ -79,10 +80,11 @@
    (map #(% 1))))
 
 (defn -main
-  "I don't do a whole lot ... yet."
+  "Download idx data from quandl. First parameter is the starting date."
   [date]
   (->
    (jk-codes "https://s3.amazonaws.com/quandl-static-content/Ticker+CSV%27s/Yahoo/JK.csv")
    (make-csv! date)
-   (time)))
+   (time))
+  (clj-http.conn-mgr/shutdown-manager cm2))
 
